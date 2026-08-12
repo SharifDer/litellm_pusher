@@ -1,0 +1,8 @@
+services:
+  pusher:
+    build: .
+    restart: unless-stopped
+    # Host networking so the container can reach LiteLLM (and, on the public
+    # server, the dashboard backend) via 127.0.0.1 exactly as configured.
+    network_mode: host
+    env_file: .env
