@@ -23,6 +23,8 @@ Always posts, even when the day has zero logs — the push itself is the
 signal that this instance has reported for the date. Re-pushing the same
 date is safe: the dashboard overwrites and reprocesses.
 """
+import gzip
+import json
 import os
 import sys
 import time
@@ -54,11 +56,19 @@ def fetch_logs(base_url: str, api_key: str, date: str, next_day: str) -> list[di
 
 
 def push(dashboard_url: str, token: str, instance: str, date: str, logs: list[dict]) -> dict:
+    # gzip the body: raw logs are text and compress ~10x, so big days upload
+    # ~10x faster and stay far under proxy/timeout limits. The dashboard
+    # decompresses when Content-Encoding: gzip is set (plain JSON still works).
+    body = gzip.compress(json.dumps({"instance": instance, "logs": logs}).encode())
     resp = requests.post(
         f"{dashboard_url}/api/ingest/{date}",
-        headers={"X-Ingest-Token": token, "Content-Type": "application/json"},
-        json={"instance": instance, "logs": logs},
-        timeout=300,
+        headers={
+            "X-Ingest-Token": token,
+            "Content-Type": "application/json",
+            "Content-Encoding": "gzip",
+        },
+        data=body,
+        timeout=(30, 900),  # 30s connect, 15min read
     )
     resp.raise_for_status()
     return resp.json()
