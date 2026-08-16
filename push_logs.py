@@ -55,23 +55,57 @@ def fetch_logs(base_url: str, api_key: str, date: str, next_day: str) -> list[di
     return data
 
 
+# Split a day's records into chunks of ~20MB serialized size. Each chunk is
+# a separate request: small uploads survive slow/flaky links that stall on
+# one big transfer, and memory stays bounded on both sides.
+CHUNK_BYTES = 20 * 1024 * 1024
+
+
+def _chunks(logs: list[dict]) -> list[list[dict]]:
+    chunks: list[list[dict]] = []
+    current: list[dict] = []
+    size = 0
+    for rec in logs:
+        rec_size = len(json.dumps(rec))
+        if current and size + rec_size > CHUNK_BYTES:
+            chunks.append(current)
+            current, size = [], 0
+        current.append(rec)
+        size += rec_size
+    chunks.append(current)  # last chunk; [[]] when the day has zero logs
+    return chunks
+
+
 def push(dashboard_url: str, token: str, instance: str, date: str, logs: list[dict]) -> dict:
-    # gzip the body: raw logs are text and compress ~10x, so big days upload
-    # ~10x faster and stay far under proxy/timeout limits. The dashboard
+    # gzip the body: raw logs are text and compress ~10x. The dashboard
     # decompresses when Content-Encoding: gzip is set (plain JSON still works).
-    body = gzip.compress(json.dumps({"instance": instance, "logs": logs}).encode())
-    resp = requests.post(
-        f"{dashboard_url}/api/ingest/{date}",
-        headers={
-            "X-Ingest-Token": token,
-            "Content-Type": "application/json",
-            "Content-Encoding": "gzip",
-        },
-        data=body,
-        timeout=(30, 900),  # 30s connect, 15min read
-    )
-    resp.raise_for_status()
-    return resp.json()
+    # First chunk overwrites the date's data for this instance; continuation
+    # chunks append; the final chunk marks the instance as reported.
+    chunks = _chunks(logs)
+    result: dict = {}
+    for i, chunk in enumerate(chunks):
+        payload = {
+            "instance": instance,
+            "logs": chunk,
+            "append": i > 0,
+            "final": i == len(chunks) - 1,
+            "total_records": len(logs),
+        }
+        body = gzip.compress(json.dumps(payload).encode())
+        resp = requests.post(
+            f"{dashboard_url}/api/ingest/{date}",
+            headers={
+                "X-Ingest-Token": token,
+                "Content-Type": "application/json",
+                "Content-Encoding": "gzip",
+            },
+            data=body,
+            timeout=(30, 300),  # 30s connect, 5min read — small chunks only
+        )
+        resp.raise_for_status()
+        result = resp.json()
+        print(f"[push_logs] Chunk {i + 1}/{len(chunks)} accepted ({len(chunk)} records)", flush=True)
+    return result
 
 
 def push_once(cfg: dict, date: str) -> int:
