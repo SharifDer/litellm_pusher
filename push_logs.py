@@ -41,6 +41,82 @@ def _require_env(name: str) -> str:
     return value
 
 
+# Fields that are always empty in LiteLLM spend logs and carry no information.
+# Dropping them shrinks payloads without losing anything useful.
+_ALWAYS_EMPTY_TOP_LEVEL = frozenset({
+    "mcp_namespaced_tool_name",
+    "agent_id",
+    "organization_id",
+})
+
+_ALWAYS_EMPTY_METADATA = frozenset({
+    "batch_models",
+    "eval_information",
+    "user_api_key_org_id",
+    "proxy_server_request",
+    "mcp_tool_call_metadata",
+    "cold_storage_object_key",
+    "user_api_key_project_id",
+    "user_api_key_project_alias",
+    "vector_store_request_metadata",
+    "compression_savings",
+})
+
+
+def _is_empty(value) -> bool:
+    """Return True for null, empty string/list/dict, or the string 'None'."""
+    if value is None:
+        return True
+    if value == "":
+        return True
+    if value == []:
+        return True
+    if value == {}:
+        return True
+    if value == "None":
+        return True
+    return False
+
+
+def prune_record(record: dict) -> dict:
+    """Remove empty fields and duplicate messages arrays from a LiteLLM record.
+
+    Keeps every field that carries information. Only drops:
+    - Known always-empty keys.
+    - proxy_server_request.messages when top-level messages already exists
+      (the backend reads top-level messages first, so the PSR copy is unused).
+    """
+    if not isinstance(record, dict):
+        return record
+
+    # Drop always-empty top-level keys.
+    pruned = {
+        k: v for k, v in record.items()
+        if not (k in _ALWAYS_EMPTY_TOP_LEVEL and _is_empty(v))
+    }
+
+    # Drop always-empty metadata sub-keys.
+    metadata = pruned.get("metadata")
+    if isinstance(metadata, dict):
+        pruned["metadata"] = {
+            k: v for k, v in metadata.items()
+            if not (k in _ALWAYS_EMPTY_METADATA and _is_empty(v))
+        }
+
+    # Drop duplicate proxy_server_request.messages when top-level messages exists.
+    top_messages = pruned.get("messages")
+    psr = pruned.get("proxy_server_request")
+    if (
+        isinstance(top_messages, list) and len(top_messages) > 0
+        and isinstance(psr, dict) and "messages" in psr
+    ):
+        pruned["proxy_server_request"] = {
+            k: v for k, v in psr.items() if k != "messages"
+        }
+
+    return pruned
+
+
 def fetch_logs(base_url: str, api_key: str, date: str, next_day: str) -> list[dict]:
     resp = requests.get(
         f"{base_url}/spend/logs",
@@ -116,6 +192,20 @@ def push_once(cfg: dict, date: str) -> int:
         try:
             logs = fetch_logs(cfg["base_url"], cfg["api_key"], date, next_day)
             print(f"[push_logs] Fetched {len(logs)} record(s) from local LiteLLM", flush=True)
+
+            # Prune empty fields and duplicate messages before sending.
+            if logs:
+                raw_size = sum(len(json.dumps(rec)) for rec in logs)
+                logs = [prune_record(rec) for rec in logs]
+                pruned_size = sum(len(json.dumps(rec)) for rec in logs)
+                saved = raw_size - pruned_size
+                print(
+                    f"[push_logs] Pruned records: {raw_size/1024/1024:.1f} MB → "
+                    f"{pruned_size/1024/1024:.1f} MB (saved {saved/1024/1024:.1f} MB, "
+                    f"{saved/raw_size*100:.1f}%)",
+                    flush=True,
+                )
+
             result = push(cfg["dashboard_url"], cfg["token"], cfg["instance"], date, logs)
             print(f"[push_logs] Dashboard accepted: {result}", flush=True)
             return 0
