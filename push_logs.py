@@ -5,7 +5,7 @@ Runs on a LiteLLM server. Two modes:
 
   Daemon mode (default, what `docker compose up -d` runs):
       Sleeps until PUSH_TIME (UTC, default 00:05), pushes yesterday's
-      /spend/logs to the dashboard, repeats every day.
+      /spend/logs/v2 (paginated) to the dashboard, repeats every day.
 
   One-shot mode (manual test / backfill):
       python push_logs.py 2026-08-10     # push that date once, then exit
@@ -117,7 +117,54 @@ def prune_record(record: dict) -> dict:
     return pruned
 
 
+# The legacy /spend/logs endpoint is unpaginated (deprecated by LiteLLM):
+# the proxy's Prisma query engine materializes the whole day in memory and
+# gets OOM-killed on big days (observed 2026-08-30/31, engine at 8-12GB RSS).
+# /spend/logs/v2 paginates, bounding memory per request. 50 records/page keeps
+# each page small even when individual records carry multi-MB payloads.
+PAGE_SIZE = 50
+
+
 def fetch_logs(base_url: str, api_key: str, date: str, next_day: str) -> list[dict]:
+    """Fetch one day's spend logs, paginated via /spend/logs/v2.
+
+    Falls back to the legacy unpaginated /spend/logs when the local LiteLLM
+    predates v2 (404 on the first page). Record shape is identical either way.
+    """
+    headers = {"Authorization": f"Bearer {api_key}"}
+    logs: list[dict] = []
+    page = 1
+    while True:
+        resp = requests.get(
+            f"{base_url}/spend/logs/v2",
+            headers=headers,
+            params={
+                "start_date": f"{date} 00:00:00",
+                "end_date": f"{next_day} 00:00:00",
+                "page": page,
+                "page_size": PAGE_SIZE,
+            },
+            timeout=120,
+        )
+        if resp.status_code == 404 and page == 1:
+            print("[push_logs] /spend/logs/v2 missing — falling back to legacy /spend/logs", flush=True)
+            return _fetch_logs_legacy(base_url, api_key, date, next_day)
+        resp.raise_for_status()
+        payload = resp.json()
+        data = payload.get("data") if isinstance(payload, dict) else payload
+        if not data:
+            break
+        logs.extend(data)
+        total_pages = payload.get("total_pages") if isinstance(payload, dict) else None
+        print(f"[push_logs] Fetched page {page}/{total_pages or '?'} ({len(logs)} records so far)", flush=True)
+        done = page >= total_pages if total_pages else len(data) < PAGE_SIZE
+        if done:
+            break
+        page += 1
+    return logs
+
+
+def _fetch_logs_legacy(base_url: str, api_key: str, date: str, next_day: str) -> list[dict]:
     resp = requests.get(
         f"{base_url}/spend/logs",
         headers={"Authorization": f"Bearer {api_key}"},
