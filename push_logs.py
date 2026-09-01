@@ -28,6 +28,7 @@ import json
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -117,22 +118,42 @@ def prune_record(record: dict) -> dict:
     return pruned
 
 
-# The legacy /spend/logs endpoint is unpaginated (deprecated by LiteLLM):
-# the proxy's Prisma query engine materializes the whole day in memory and
-# gets OOM-killed on big days (observed 2026-08-30/31, engine at 8-12GB RSS).
-# /spend/logs/v2 paginates, bounding memory per request. 50 records/page keeps
-# each page small even when individual records carry multi-MB payloads.
-PAGE_SIZE = 50
+# Fetch strategy (both ends of it are dictated by LiteLLM endpoint behavior):
+# - Legacy full-day /spend/logs is unpaginated: the proxy's Prisma query
+#   engine materializes the whole day in memory and gets OOM-killed on big
+#   days (observed 2026-08-30/31, engine at 8-12GB RSS).
+# - /spend/logs/v2 paginates BUT deliberately excludes the heavy columns
+#   (messages, response, proxy_server_request) — LiteLLM source comments say
+#   those are only served by the detail endpoint. The dashboard needs them
+#   to build sessions.
+# So: list the day cheaply via v2 (light rows), then fetch each full record
+# by request_id from the legacy endpoint — single-row lookups are cheap for
+# the engine and return complete records.
+LIST_PAGE_SIZE = 100
+FETCH_WORKERS = 8
 
 
 def fetch_logs(base_url: str, api_key: str, date: str, next_day: str) -> list[dict]:
-    """Fetch one day's spend logs, paginated via /spend/logs/v2.
+    """Fetch one day's complete spend logs (v2 list + per-record detail).
 
-    Falls back to the legacy unpaginated /spend/logs when the local LiteLLM
-    predates v2 (404 on the first page). Record shape is identical either way.
+    Falls back to the legacy full-day fetch when the local LiteLLM predates
+    /spend/logs/v2 (404 on the first page).
     """
     headers = {"Authorization": f"Bearer {api_key}"}
-    logs: list[dict] = []
+    light = _list_day_light(base_url, headers, date, next_day)
+    if light is None:
+        print("[push_logs] /spend/logs/v2 missing — falling back to legacy full-day fetch", flush=True)
+        return _fetch_logs_legacy(base_url, api_key, date, next_day)
+    request_ids = [r.get("request_id") for r in light if r.get("request_id")]
+    if not request_ids:
+        return []
+    print(f"[push_logs] Listed {len(request_ids)} request(s); fetching full records...", flush=True)
+    return _fetch_full_records(base_url, headers, request_ids)
+
+
+def _list_day_light(base_url: str, headers: dict, date: str, next_day: str) -> list[dict] | None:
+    """All light rows for the day via paginated /spend/logs/v2. None on 404."""
+    rows: list[dict] = []
     page = 1
     while True:
         resp = requests.get(
@@ -142,26 +163,62 @@ def fetch_logs(base_url: str, api_key: str, date: str, next_day: str) -> list[di
                 "start_date": f"{date} 00:00:00",
                 "end_date": f"{next_day} 00:00:00",
                 "page": page,
-                "page_size": PAGE_SIZE,
+                "page_size": LIST_PAGE_SIZE,
             },
             timeout=120,
         )
         if resp.status_code == 404 and page == 1:
-            print("[push_logs] /spend/logs/v2 missing — falling back to legacy /spend/logs", flush=True)
-            return _fetch_logs_legacy(base_url, api_key, date, next_day)
+            return None
         resp.raise_for_status()
         payload = resp.json()
         data = payload.get("data") if isinstance(payload, dict) else payload
         if not data:
             break
-        logs.extend(data)
+        rows.extend(data)
         total_pages = payload.get("total_pages") if isinstance(payload, dict) else None
-        print(f"[push_logs] Fetched page {page}/{total_pages or '?'} ({len(logs)} records so far)", flush=True)
-        done = page >= total_pages if total_pages else len(data) < PAGE_SIZE
+        print(f"[push_logs] Listed page {page}/{total_pages or '?'} ({len(rows)} requests so far)", flush=True)
+        done = page >= total_pages if total_pages else len(data) < LIST_PAGE_SIZE
         if done:
             break
         page += 1
-    return logs
+    return rows
+
+
+def _fetch_full_records(base_url: str, headers: dict, request_ids: list[str]) -> list[dict]:
+    """Fetch each full record by request_id from the legacy endpoint.
+
+    A record that fails 3 times raises — a silently dropped record loses its
+    prompt content for good, so better to fail the day and let the outer
+    retry loop rerun it.
+    """
+    def fetch_one(request_id: str) -> dict | None:
+        for attempt in range(3):
+            try:
+                resp = requests.get(
+                    f"{base_url}/spend/logs",
+                    headers=headers,
+                    params={"request_id": request_id},
+                    timeout=120,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                if isinstance(data, list):
+                    return data[0] if data else None
+                return data or None
+            except Exception:
+                if attempt == 2:
+                    raise
+                time.sleep(2 * (attempt + 1))
+        return None
+
+    records: list[dict] = []
+    with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as pool:
+        for i, rec in enumerate(pool.map(fetch_one, request_ids), start=1):
+            if rec:
+                records.append(rec)
+            if i % 200 == 0 or i == len(request_ids):
+                print(f"[push_logs] Full records: {i}/{len(request_ids)}", flush=True)
+    return records
 
 
 def _fetch_logs_legacy(base_url: str, api_key: str, date: str, next_day: str) -> list[dict]:
