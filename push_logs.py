@@ -8,7 +8,8 @@ Runs on a LiteLLM server. Two modes:
       /spend/logs/v2 (paginated) to the dashboard, repeats every day.
 
   One-shot mode (manual test / backfill):
-      python push_logs.py 2026-08-10     # push that date once, then exit
+      python push_logs.py 2026-08-10            # push that date once, then exit
+      python push_logs.py 2026-08-10 --force    # re-push even if already processed
 
 Configuration via environment variables (in .env next to docker-compose.yml):
 
@@ -16,12 +17,15 @@ Configuration via environment variables (in .env next to docker-compose.yml):
   LITELLM_API_KEY   Master/admin key for the local instance
   DASHBOARD_URL     Dashboard backend URL, e.g. https://dash.example.com
   INGEST_TOKEN      Shared secret matching the dashboard's INGEST_TOKEN
-  INSTANCE_NAME     "public" or "private"
+  INSTANCE_NAME     Optional, any string identifying this instance (default "main")
   PUSH_TIME         Optional, "HH:MM" UTC (default "00:05")
+  FORCE             Optional, "true" to force one-shot pushes (same as --force)
 
 Always posts, even when the day has zero logs — the push itself is the
-signal that this instance has reported for the date. Re-pushing the same
-date is safe: the dashboard overwrites and reprocesses.
+signal that this instance has reported for the date. Re-pushing an
+already-processed date is a no-op unless forced: the dashboard skips
+reprocessing unless the payload carries "force": true (--force / FORCE=true
+is the manual-correction tool).
 """
 import gzip
 import json
@@ -256,7 +260,7 @@ def _chunks(logs: list[dict]) -> list[list[dict]]:
     return chunks
 
 
-def push(dashboard_url: str, token: str, instance: str, date: str, logs: list[dict]) -> dict:
+def push(dashboard_url: str, token: str, instance: str, date: str, logs: list[dict], force: bool = False) -> dict:
     # gzip the body: raw logs are text and compress ~10x. The dashboard
     # decompresses when Content-Encoding: gzip is set (plain JSON still works).
     # First chunk overwrites the date's data for this instance; continuation
@@ -270,6 +274,7 @@ def push(dashboard_url: str, token: str, instance: str, date: str, logs: list[di
             "append": i > 0,
             "final": i == len(chunks) - 1,
             "total_records": len(logs),
+            "force": force,
         }
         body = gzip.compress(json.dumps(payload).encode())
         resp = requests.post(
@@ -288,10 +293,10 @@ def push(dashboard_url: str, token: str, instance: str, date: str, logs: list[di
     return result
 
 
-def push_once(cfg: dict, date: str) -> int:
+def push_once(cfg: dict, date: str, force: bool = False) -> int:
     """Fetch + push one date with retries. Returns exit code."""
     next_day = (datetime.strptime(date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
-    print(f"[push_logs] {datetime.now(timezone.utc).isoformat()} — instance={cfg['instance']} date={date}", flush=True)
+    print(f"[push_logs] {datetime.now(timezone.utc).isoformat()} — instance={cfg['instance']} date={date} force={force}", flush=True)
     for attempt in range(1, 4):
         try:
             logs = fetch_logs(cfg["base_url"], cfg["api_key"], date, next_day)
@@ -310,7 +315,7 @@ def push_once(cfg: dict, date: str) -> int:
                     flush=True,
                 )
 
-            result = push(cfg["dashboard_url"], cfg["token"], cfg["instance"], date, logs)
+            result = push(cfg["dashboard_url"], cfg["token"], cfg["instance"], date, logs, force=force)
             print(f"[push_logs] Dashboard accepted: {result}", flush=True)
             return 0
         except Exception as e:
@@ -335,18 +340,17 @@ def main() -> int:
         "api_key": _require_env("LITELLM_API_KEY"),
         "dashboard_url": _require_env("DASHBOARD_URL").rstrip("/"),
         "token": _require_env("INGEST_TOKEN"),
-        "instance": _require_env("INSTANCE_NAME"),
+        "instance": os.getenv("INSTANCE_NAME", "main").strip() or "main",
     }
-    if cfg["instance"] not in ("public", "private"):
-        print('[push_logs] ERROR: INSTANCE_NAME must be "public" or "private"', file=sys.stderr)
-        return 2
     push_time = os.getenv("PUSH_TIME", "00:05")
 
-    # One-shot mode: push the given date and exit.
+    # One-shot mode: push the given date and exit. `--force` (or FORCE=true)
+    # tells the dashboard to reprocess an already-processed date.
     if len(sys.argv) > 1:
         date = sys.argv[1]
         datetime.strptime(date, "%Y-%m-%d")  # validates format, exits on bad input
-        return push_once(cfg, date)
+        force = "--force" in sys.argv[2:] or os.getenv("FORCE", "").lower() == "true"
+        return push_once(cfg, date, force=force)
 
     # Daemon mode: push yesterday (UTC) every day at PUSH_TIME.
     print(f"[push_logs] Daemon started — daily push at {push_time} UTC", flush=True)
